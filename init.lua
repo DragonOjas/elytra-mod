@@ -1,166 +1,117 @@
--- ============================================================
--- ELYTRA PRO: STANDALONE EDITION
--- No external APIs required.
--- ============================================================
+local core = minetest
+local get_players = core.get_connected_players
+local api_path = core.get_modpath("player_api")
 
-local elytra = {
-    players = {},
-    timer = 0,
-    -- Configuration
-    MAX_SPEED = 45,
-    STALL_SPEED = 8,
-    DIVE_BOOST = 18,
-    DRAG = 0.6,
-    GRAVITY_FALLOFF = 1.8
-}
+local ELYTRA_ITEM = "elytra:wings"
+local tick_timer = 0
 
--- 1. Registering the Item
-minetest.register_tool("elytra:wings", {
-    description = "Advanced Elytra\n[Jump in mid-air to Glide]\n[Sneak to Cancel]",
+core.register_tool(ELYTRA_ITEM, {
+    description = "Aero-Wings\nJump while falling to glide.\nSneak to land.",
     inventory_image = "elytra_item.png",
     groups = {tool = 1},
-    wear_represents = "durability",
 })
 
--- 2. Helper: Reset Player State
-local function stop_flying(player, name)
-    elytra.players[name] = nil
+local function stop_flight(player)
+    if not player or not player:is_player() then return end
+    
+    local meta = player:get_meta()
+    if meta:get_int("is_gliding") == 0 then return end
+    
+    meta:set_int("is_gliding", 0)
+    meta:set_float("glide_speed", 0)
+    
     player:set_physics_override({gravity = 1.0})
     
-    -- Reset FOV and Animation
-    player:set_fov(0) 
-    if minetest.get_modpath("player_api") then
+    if api_path then
         player_api.set_animation(player, "stand")
     end
     
-    -- Remove HUD Speedometer
-    local hud_id = player:get_meta():get_int("elytra_hud")
-    if hud_id then
-        player:hud_remove(hud_id)
-        player:get_meta():set_int("elytra_hud", 0)
+    local handle = meta:get_int("wind_snd")
+    if handle and handle ~= 0 then
+        core.sound_stop(handle)
+        meta:set_int("wind_snd", 0)
     end
 end
 
--- 3. The Flight Engine
-minetest.register_globalstep(function(dtime)
-    elytra.timer = elytra.timer + dtime
-    local do_fx = false
-    if elytra.timer > 0.1 then
-        do_fx = true
-        elytra.timer = 0
-    end
+core.register_globalstep(function(dtime)
+    -- Guard against dtime being nil (rare engine edge case)
+    dtime = dtime or 0.05
+    tick_timer = tick_timer + dtime
+    
+    if tick_timer < 0.05 then return end
+    local fx_tick = (tick_timer > 0.2)
+    if fx_tick then tick_timer = 0 end
 
-    for _, player in ipairs(minetest.get_connected_players()) do
-        local name = player:get_player_name()
-        local controls = player:get_player_control()
-        local vel = player:get_velocity()
-        local item = player:get_wielded_item()
-        local is_wielding = (item:get_name() == "elytra:wings")
-        
-        -- START FLYING LOGIC
-        if is_wielding and vel.y < -2.5 and controls.jump and not elytra.players[name] then
-            elytra.players[name] = {speed = 12, last_vel = vel}
-            player:set_physics_override({gravity = 0})
+    for _, player in ipairs(get_players()) do
+        -- Nil-Guard: Ensure player didn't vanish since the loop started
+        if player and player:is_player() then
+            local meta = player:get_meta()
+            local gliding = meta:get_int("is_gliding") == 1
+            local item = player:get_wielded_item()
+            local item_name = item and item:get_name() or ""
+            local has_wings = (item_name == ELYTRA_ITEM)
             
-            -- Set custom "Lay" animation
-            if minetest.get_modpath("player_api") then
-                player_api.set_animation(player, "lay")
+            -- Sane defaults for velocity and controls
+            local vel = player:get_velocity() or {x=0, y=0, z=0}
+            local ctrl = player:get_player_control() or {}
+
+            if has_wings and not gliding and (vel.y or 0) < -3.5 and ctrl.jump then
+                meta:set_int("is_gliding", 1)
+                player:set_physics_override({gravity = 0})
+                if api_path then player_api.set_animation(player, "lay") end
+                
+                local handle = core.sound_play("elytra_wind", {object = player, loop = true, gain = 0.4})
+                meta:set_int("wind_snd", handle or 0)
             end
 
-            -- Create HUD
-            local id = player:hud_add({
-                hud_elem_type = "text",
-                position = {x = 0.5, y = 0.85},
-                text = "Airspeed: 0 m/s",
-                number = 0x00FF00,
-            })
-            player:get_meta():set_int("elytra_hud", id)
-        end
+            if gliding then
+                local pos = player:get_pos()
+                local node = pos and core.get_node_or_nil({x=pos.x, y=pos.y-1, z=pos.z})
+                local is_walkable = node and core.registered_nodes[node.name] and core.registered_nodes[node.name].walkable
 
-        -- FLYING PHYSICS LOGIC
-        if elytra.players[name] then
-            local pos = player:get_pos()
-            local data = elytra.players[name]
-            
-            -- Check for ground collision or manual stop
-            local node = minetest.get_node({x=pos.x, y=pos.y-1, z=pos.z})
-            if controls.sneak or not is_wielding or minetest.registered_nodes[node.name].walkable then
-                -- Impact Damage Logic
-                local impact = math.abs(data.last_vel.x) + math.abs(data.last_vel.z)
-                if impact > 20 then
-                    player:set_hp(player:get_hp() - (impact / 4))
-                end
-                stop_flying(player, name)
-            else
-                -- Aerodynamics Calculation
-                local look = player:get_look_dir()
-                local pitch = player:get_look_vertical() -- Down is +, Up is -
-                
-                -- Adjust speed based on pitch
-                if pitch > 0.1 then -- Diving
-                    data.speed = math.min(data.speed + (pitch * elytra.DIVE_BOOST * dtime), elytra.MAX_SPEED)
-                elseif pitch < -0.1 then -- Climbing
-                    data.speed = math.max(data.speed + (pitch * 25 * dtime), 0)
-                else -- Horizontal Drag
-                    data.speed = math.max(data.speed - (elytra.DRAG * dtime), 5)
-                end
-
-                -- Apply Stall mechanics
-                local glide_drop = 1.0
-                if data.speed < elytra.STALL_SPEED then
-                    glide_drop = 7.0 -- Fall like a stone
-                end
-
-                -- Final Velocity Calculation
-                local new_vel = {
-                    x = look.x * data.speed,
-                    y = (look.y * data.speed) - glide_drop,
-                    z = look.z * data.speed
-                }
-                player:set_velocity(new_vel)
-                data.last_vel = new_vel
-
-                -- Visual Effects (FOV and HUD)
-                if do_fx then
-                    -- Dynamic FOV (makes it feel fast!)
-                    player:set_fov(80 + (data.speed * 0.8))
+                if ctrl.sneak or not has_wings or is_walkable then
+                    stop_flight(player)
+                else
+                    local dir = player:get_look_dir() or {x=0, y=0, z=0}
+                    local pitch = player:get_look_vertical() or 0
+                    local speed = meta:get_float("glide_speed")
                     
-                    -- Update Speedometer
-                    local hud_id = player:get_meta():get_int("elytra_hud")
-                    player:hud_change(hud_id, "text", "Airspeed: " .. math.floor(data.speed) .. " m/s")
+                    if speed < 5 then speed = 12 end
                     
-                    -- Particulates
-                    minetest.add_particle({
-                        pos = pos,
-                        velocity = {x=0, y=2, z=0},
-                        expirationtime = 0.4,
-                        size = 2,
-                        texture = "elytra_particle.png",
+                    if pitch > 0.15 then
+                        speed = math.min(speed + (pitch * 1.8), 40)
+                    elseif pitch < -0.15 then
+                        speed = math.max(speed + (pitch * 2.5), 2)
+                    else
+                        speed = math.max(speed - 0.1, 8)
+                    end
+                    
+                    meta:set_float("glide_speed", speed)
+
+                    local lift = (speed < 10) and 4.0 or 1.2 
+                    player:set_velocity({
+                        x = (dir.x or 0) * speed,
+                        y = ((dir.y or 0) * speed) - lift,
+                        z = (dir.z or 0) * speed
                     })
 
-                    -- Wear out the wings
-                    item:add_wear(40)
-                    player:set_wielded_item(item)
+                    if fx_tick then
+                        core.add_particle({
+                            pos = pos,
+                            velocity = {x=0, y=0, z=0},
+                            expirationtime = 0.4,
+                            size = 1.5,
+                            texture = "elytra_particle.png",
+                        })
+                        item:add_wear(45)
+                        player:set_wielded_item(item)
+                    end
                 end
             end
         end
     end
 end)
 
--- 4. Sound & Cleanup
-minetest.register_on_leaveplayer(function(player)
-    stop_flying(player, player:get_player_name())
+core.register_on_leaveplayer(function(player)
+    stop_flight(player)
 end)
-
--- 5. Recipe (Using standard base game items)
-minetest.register_craft({
-    output = "elytra:wings",
-    recipe = {
-        {"default:steel_ingot", "default:mese_crystal", "default:steel_ingot"},
-        {"default:diamond",     "default:obsidian",      "default:diamond"},
-        {"default:leather",     "",                      "default:leather"},
-    }
-})
-
--- Total Logic Lines: ~140. 
--- To reach 200, you can add specific sound triggers or more complex crafting!
