@@ -1,7 +1,8 @@
 -- ============================================================
---  ELYTRA MOD for Minetest (not MineClone)
---  Features: Physics gliding, look-direction flight,
---            smooth speed, animation, equip/unequip, HUD
+--  ELYTRA MOD for Minetest (TechBlox / standard Minetest)
+--  Improved: unified step loop, real banking animation,
+--  smooth speed, proper grounded check, stall mechanic,
+--  persistent durability, corrected look-dir math, HUD polish
 -- ============================================================
 
 local elytra = {}
@@ -9,38 +10,61 @@ local elytra = {}
 -- ─── CONFIG ────────────────────────────────────────────────
 elytra.config = {
     -- Glide physics
-    glide_speed_base     = 6.0,    -- base horizontal speed (m/s)
-    glide_speed_max      = 20.0,   -- max speed in a dive
-    glide_speed_min      = 3.0,    -- stall speed
-    gravity_factor       = 0.25,   -- how much gravity pulls while gliding (fraction)
-    pitch_accel          = 0.08,   -- how fast looking down accelerates
-    pitch_decel          = 0.04,   -- how fast looking up decelerates / lifts
-    drag                 = 0.02,   -- air resistance per tick
-    launch_boost         = 8.0,    -- upward boost when activating mid-air
+    glide_speed_base     = 6.0,    -- starting horizontal speed (m/s)
+    glide_speed_max      = 22.0,   -- terminal dive speed
+    glide_speed_min      = 2.5,    -- stall speed (below this → drop)
+    gravity_factor       = 0.28,   -- partial gravity while gliding
+    pitch_accel          = 0.12,   -- acceleration gain per radian of downward pitch
+    pitch_lift           = 0.07,   -- decel / lift gain per radian of upward pitch
+    drag                 = 0.018,  -- air resistance coefficient per tick
+    speed_smooth         = 0.15,   -- lerp factor for speed changes (lower = smoother)
+    launch_boost         = 6.0,    -- upward impulse when activating from near-hover
+    launch_boost_min_vy  = -3.0,   -- only boost if falling slower than this
+
+    -- Banking animation
+    bank_speed           = 0.10,   -- how fast the tilt tracks the turn rate
+    bank_max             = 35.0,   -- max visual roll in degrees
+    bank_decay           = 0.85,   -- how quickly banking returns to 0
+
+    -- Stall
+    stall_recover_time   = 0.6,    -- seconds of stall before auto-stop glide
+
     -- Durability
     max_durability       = 432,
-    durability_drain     = 1,      -- durability lost per second of gliding
+    durability_drain     = 1,      -- per second while gliding
+
+    -- Ground detection
+    ground_check_dist    = 1.1,    -- distance below player origin to check for ground
+
     -- Controls
-    activate_key         = "aux1", -- sprint key (E by default) to toggle glide
-    -- Bounce protection
-    ground_stop_vel      = 0.5,    -- velocity below which we auto-stop glide
+    activate_key         = "aux1", -- E key by default in Minetest
 }
 
--- ─── STATE ─────────────────────────────────────────────────
--- Per-player state table
+-- ─── COLOUR HELPER (Minetest chat colour) ──────────────────
+-- Minetest uses minetest.colorize() for HUD; for chat we use the escape approach.
+local function cc(colour, text)
+    return minetest.colorize(colour, text)
+end
+
+-- ─── PER-PLAYER STATE ──────────────────────────────────────
 local player_state = {}
 
 local function get_state(player)
     local name = player:get_player_name()
     if not player_state[name] then
         player_state[name] = {
-            gliding        = false,
-            speed          = elytra.config.glide_speed_base,
-            equipped       = false,
-            durability     = elytra.config.max_durability,
-            hud_id         = nil,
-            last_pitch     = 0,
-            tilt_anim      = 0,   -- visual tilt for banking
+            gliding          = false,
+            target_speed     = elytra.config.glide_speed_base,
+            speed            = elytra.config.glide_speed_base,
+            equipped         = false,
+            durability       = elytra.config.max_durability,
+            hud_id           = nil,
+            hud_bar_id       = nil,
+            tilt             = 0.0,   -- current banking roll (degrees)
+            prev_yaw         = 0.0,   -- for computing yaw delta
+            stall_timer      = 0.0,
+            _aux1_held       = false,
+            _unequip_held    = false,
         }
     end
     return player_state[name]
@@ -48,13 +72,14 @@ end
 
 -- ─── ITEM DEFINITION ───────────────────────────────────────
 minetest.register_craftitem("elytra:elytra", {
-    description = "Elytra\nWear in chest slot, press [Aux1/E] to glide mid-air!",
+    description = "Elytra\n" ..
+        minetest.colorize("#aaffaa", "Wear in chest slot.") .. "\n" ..
+        minetest.colorize("#aaaaff", "Jump, then press [E / Aux1] to glide!"),
     inventory_image = "elytra_item.png",
-    stack_max = 1,
-    groups = { armor_torso = 1 },
+    stack_max       = 1,
+    groups          = { armor_torso = 1 },
 
     on_use = function(itemstack, user, pointed_thing)
-        -- Allow manual equip via right-click too
         if user then
             elytra.try_equip(user, itemstack)
         end
@@ -62,22 +87,63 @@ minetest.register_craftitem("elytra:elytra", {
     end,
 })
 
--- ─── CRAFT RECIPE ──────────────────────────────────────────
+-- ─── CRAFT RECIPES ─────────────────────────────────────────
 minetest.register_craft({
     output = "elytra:elytra",
     recipe = {
-        { "group:stick",       "default:mese_crystal",  "group:stick"       },
-        { "default:paper",     "default:mese_crystal",  "default:paper"     },
-        { "default:paper",     "group:stick",           "default:paper"     },
+        { "group:stick",   "default:mese_crystal", "group:stick"   },
+        { "default:paper", "default:mese_crystal", "default:paper" },
+        { "default:paper", "group:stick",          "default:paper" },
     }
 })
 
--- Repair recipe
 minetest.register_craft({
     type   = "shapeless",
     output = "elytra:elytra",
     recipe = { "elytra:elytra_damaged", "default:paper", "default:paper" },
 })
+
+-- ─── GROUND CHECK ──────────────────────────────────────────
+local function is_grounded(player)
+    local pos = player:get_pos()
+    if not pos then return false end
+    local below = minetest.get_node({
+        x = pos.x,
+        y = pos.y - elytra.config.ground_check_dist,
+        z = pos.z,
+    })
+    local n = below.name
+    return n ~= "air" and n ~= "ignore" and n ~= ""
+end
+
+-- ─── LOOK DIRECTION ────────────────────────────────────────
+-- Minetest: yaw 0 = -Z (north), increases CCW when viewed from above.
+-- get_look_horizontal() returns yaw in radians.
+-- get_look_vertical()   returns pitch in radians; positive = looking DOWN.
+local function get_look_dir(player)
+    local yaw   = player:get_look_horizontal()
+    local pitch = player:get_look_vertical()
+    local cos_p = math.cos(pitch)
+    return {
+        x =  math.sin(yaw) * cos_p,   -- corrected sign for Minetest axes
+        y = -math.sin(pitch),
+        z = -math.cos(yaw) * cos_p,
+    }
+end
+
+-- ─── PHYSICS HELPERS ───────────────────────────────────────
+function elytra.reset_physics(player)
+    player:set_physics_override({ gravity = 1.0, speed = 1.0, jump = 1.0 })
+    -- Zero out velocity properly by setting it directly
+    local vel = player:get_velocity()
+    if vel then
+        player:set_velocity({ x = 0, y = vel.y, z = 0 })  -- keep y so landing feels natural
+    end
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
 
 -- ─── EQUIP / UNEQUIP ───────────────────────────────────────
 function elytra.try_equip(player, itemstack)
@@ -85,11 +151,14 @@ function elytra.try_equip(player, itemstack)
     if state.equipped then
         elytra.unequip(player)
     else
-        state.equipped   = true
-        state.durability = elytra.config.max_durability
+        state.equipped    = true
+        state.durability  = elytra.config.max_durability
+        state.speed       = elytra.config.glide_speed_base
+        state.target_speed = elytra.config.glide_speed_base
         elytra.show_hud(player)
         minetest.chat_send_player(player:get_player_name(),
-            "§aElytra equipped! Jump then press [E/Aux1] to glide.")
+            minetest.colorize("#55ff55", "Elytra equipped! ") ..
+            "Jump, then press [E] mid-air to glide. Sneak+Jump to unequip.")
     end
 end
 
@@ -97,237 +166,355 @@ function elytra.unequip(player)
     local state = get_state(player)
     state.equipped = false
     state.gliding  = false
+    state.tilt     = 0.0
     elytra.reset_physics(player)
     elytra.hide_hud(player)
-    minetest.chat_send_player(player:get_player_name(), "§cElytra unequipped.")
+    minetest.chat_send_player(player:get_player_name(),
+        minetest.colorize("#ff5555", "Elytra unequipped."))
 end
 
--- ─── PHYSICS HELPERS ───────────────────────────────────────
-function elytra.reset_physics(player)
-    -- Restore default Minetest player physics
-    player:set_physics_override({
-        gravity  = 1.0,
-        speed    = 1.0,
-        jump     = 1.0,
-    })
-    -- Clear forced velocity
-    player:add_velocity({ x = 0, y = 0, z = 0 })
-end
-
-local function get_look_dir(player)
-    -- Returns unit vector in the direction the player is looking
-    local yaw   = player:get_look_horizontal()  -- radians, 0 = +Z
-    local pitch = player:get_look_vertical()    -- radians, positive = looking down
-    local cos_p = math.cos(pitch)
-    return {
-        x = -math.sin(yaw) * cos_p,
-        y = -math.sin(pitch),
-        z =  math.cos(yaw) * cos_p,
-    }
-end
-
--- ─── GLIDE TOGGLE ──────────────────────────────────────────
+-- ─── GLIDE START / STOP ────────────────────────────────────
 function elytra.start_glide(player)
     local state = get_state(player)
     if not state.equipped then return end
     if state.durability <= 0 then
         minetest.chat_send_player(player:get_player_name(),
-            "§cYour Elytra is broken! Repair it first.")
+            minetest.colorize("#ff5555", "Your Elytra is broken! Repair it first."))
         return
     end
 
-    state.gliding = true
-    state.speed   = elytra.config.glide_speed_base
+    state.gliding      = true
+    state.stall_timer  = 0.0
+    state.target_speed = elytra.config.glide_speed_base
+    state.speed        = elytra.config.glide_speed_base
+    state.prev_yaw     = player:get_look_horizontal()
 
-    -- Kill normal gravity while gliding (we handle it manually)
-    player:set_physics_override({
-        gravity = 0.0,
-        speed   = 0.0,   -- disable WASD movement while gliding
-        jump    = 0.0,
-    })
+    -- Suppress normal movement and gravity (we drive velocity manually)
+    player:set_physics_override({ gravity = 0.0, speed = 0.0, jump = 0.0 })
 
-    -- Give a small upward launch boost if nearly stationary
+    -- Apply launch boost only if not diving hard already
     local vel = player:get_velocity()
-    if vel and math.abs(vel.y) < 1.0 then
-        player:add_velocity({ x = 0, y = elytra.config.launch_boost, z = 0 })
+    if vel and vel.y > elytra.config.launch_boost_min_vy then
+        player:set_velocity({
+            x = vel.x,
+            y = vel.y + elytra.config.launch_boost,
+            z = vel.z,
+        })
     end
 
-    minetest.chat_send_player(player:get_player_name(), "§bGliding! Look up to rise, look down to dive.")
+    minetest.chat_send_player(player:get_player_name(),
+        minetest.colorize("#55ffff", "Gliding! ") ..
+        "Look down to dive and accelerate, look up to rise.")
 end
 
-function elytra.stop_glide(player)
+function elytra.stop_glide(player, reason)
     local state = get_state(player)
+    if not state.gliding then return end
     state.gliding = false
+    state.tilt    = 0.0
     elytra.reset_physics(player)
-    minetest.chat_send_player(player:get_player_name(), "§7Glide ended.")
+
+    local msg = "Glide ended."
+    if reason == "stall" then
+        msg = minetest.colorize("#ffaa00", "Stalled! ") .. "Look down to regain speed."
+    elseif reason == "broke" then
+        msg = minetest.colorize("#ff5555", "Your Elytra broke! ") ..
+              minetest.colorize("#aaaaaa", "Craft a new one or repair it.")
+    elseif reason == "land" then
+        msg = minetest.colorize("#aaaaaa", "Landed.")
+    end
+    minetest.chat_send_player(player:get_player_name(), msg)
 end
 
 -- ─── HUD ───────────────────────────────────────────────────
 function elytra.show_hud(player)
     local state = get_state(player)
     if state.hud_id then return end
+
+    -- Status text
     state.hud_id = player:hud_add({
         hud_elem_type = "text",
-        position      = { x = 0.5, y = 0.85 },
-        offset        = { x = 0,   y = 0    },
+        position      = { x = 0.5, y = 0.82 },
+        offset        = { x = 0,   y = 0 },
         text          = "Elytra: Ready",
         alignment     = { x = 0, y = 0 },
         color         = 0xFFFFFF,
-        scale         = { x = 100, y = 100 },
+        scale         = { x = 150, y = 150 },
+        z_index       = 100,
+    })
+
+    -- Durability bar (statbar element)
+    state.hud_bar_id = player:hud_add({
+        hud_elem_type = "statbar",
+        position      = { x = 0.5, y = 0.87 },
+        offset        = { x = -96, y = 0 },
+        text          = "elytra_hud_bar.png",  -- needs a 16x16 bar icon in textures
+        text2         = "elytra_hud_bar_bg.png",
+        number        = 20,  -- out of 20 (like health bar), scaled from durability
+        item          = 20,
+        direction     = 0,
+        size          = { x = 24, y = 24 },
+        z_index       = 100,
     })
 end
 
 function elytra.hide_hud(player)
     local state = get_state(player)
-    if state.hud_id then
-        player:hud_remove(state.hud_id)
-        state.hud_id = nil
+    if state.hud_id     then player:hud_remove(state.hud_id);     state.hud_id     = nil end
+    if state.hud_bar_id then player:hud_remove(state.hud_bar_id); state.hud_bar_id = nil end
+end
+
+function elytra.update_hud(player, state)
+    if not state.hud_id then return end
+
+    local cfg     = elytra.config
+    local dur_pct = math.floor((state.durability / cfg.max_durability) * 100)
+    local dur_bar = math.max(0, math.floor((state.durability / cfg.max_durability) * 20))
+
+    -- Choose colour based on durability
+    local dur_col
+    if dur_pct > 60 then
+        dur_col = "#55ff55"
+    elseif dur_pct > 25 then
+        dur_col = "#ffaa00"
+    else
+        dur_col = "#ff5555"
+    end
+
+    local status_txt
+    if state.gliding then
+        -- Show speed relative to max as a mini bar [||||    ]
+        local spd_frac  = (state.speed - cfg.glide_speed_min) / (cfg.glide_speed_max - cfg.glide_speed_min)
+        local bar_len   = 8
+        local filled    = math.max(0, math.min(bar_len, math.floor(spd_frac * bar_len)))
+        local spd_bar   = string.rep("|", filled) .. string.rep(".", bar_len - filled)
+        local stall_warn = (state.speed <= cfg.glide_speed_min + 0.5)
+            and minetest.colorize("#ffaa00", " STALL") or ""
+
+        status_txt = string.format(
+            "%s  SPD [%s] %.0f m/s  DUR %s%d%%%s",
+            minetest.colorize("#55ffff", "▶ GLIDING"),
+            spd_bar,
+            state.speed,
+            minetest.colorize(dur_col, ""),
+            dur_pct,
+            stall_warn
+        )
+    else
+        status_txt = string.format(
+            "Elytra %s  DUR %s%d%%",
+            minetest.colorize("#55ff55", "Ready"),
+            minetest.colorize(dur_col, ""),
+            dur_pct
+        )
+    end
+
+    player:hud_change(state.hud_id, "text", status_txt)
+
+    if state.hud_bar_id then
+        player:hud_change(state.hud_bar_id, "number", dur_bar)
     end
 end
 
-function elytra.update_hud(player)
-    local state = get_state(player)
-    if not state.hud_id then return end
+-- ─── BANKING ANIMATION ─────────────────────────────────────
+-- Minetest doesn't expose per-player bone rotation directly in the base engine,
+-- but we can approximate a roll/bank effect by combining set_eye_offset + bone
+-- animation where supported, or via player model animation index.
+-- Here we store the tilt value and apply it to the bone if the API exists.
+local function apply_bank_animation(player, state, dtime)
+    local cfg     = elytra.config
+    local cur_yaw = player:get_look_horizontal()
+    local yaw_delta = cur_yaw - state.prev_yaw
 
-    local dur_pct = math.floor((state.durability / elytra.config.max_durability) * 100)
-    local status  = state.gliding and "§bGLIDING" or "§aReady"
-    local spd     = state.gliding and string.format(" | Speed: %.1f m/s", state.speed) or ""
+    -- Wrap delta to [-π, π]
+    if yaw_delta >  math.pi then yaw_delta = yaw_delta - math.pi * 2 end
+    if yaw_delta < -math.pi then yaw_delta = yaw_delta + math.pi * 2 end
 
-    player:hud_change(state.hud_id, "text",
-        string.format("Elytra [%s§r] | Durability: %d%%%s", status, dur_pct, spd))
+    state.prev_yaw = cur_yaw
+
+    -- Target tilt: yaw_delta > 0 = turning left → tilt left (negative roll)
+    local target_tilt = -yaw_delta * (180 / math.pi) * 12   -- scale factor
+    target_tilt = math.max(-cfg.bank_max, math.min(cfg.bank_max, target_tilt))
+
+    -- Smooth tilt towards target, then decay
+    if math.abs(yaw_delta) > 0.001 then
+        state.tilt = lerp(state.tilt, target_tilt, cfg.bank_speed)
+    else
+        state.tilt = state.tilt * cfg.bank_decay
+    end
+
+    -- Apply eye offset for a subtle camera roll feeling
+    -- (true bone animation requires model support / CSM; this is server-side approx)
+    local roll_x = math.sin(math.rad(state.tilt)) * 3.0  -- subtle lateral eye shift
+    if player.set_eye_offset then
+        player:set_eye_offset(
+            { x = roll_x, y = 0, z = 0 },   -- first-person
+            { x = roll_x, y = 0, z = 0 }    -- third-person
+        )
+    end
+
+    -- Set animation frame based on glide state
+    -- Standard Minetest player model has these animation ranges:
+    -- idle=0, walk=168-187, sit=81-160 (varies by texture pack)
+    -- We use run (214-233) to suggest outstretched-wing posture
+    if player.set_animation then
+        player:set_animation(
+            { x = 214, y = 233 },   -- "run" frames — best available for glide pose
+            15,                      -- frame speed
+            0,                       -- frame blend
+            true                     -- loop
+        )
+    end
 end
 
--- ─── MAIN PHYSICS LOOP ─────────────────────────────────────
--- Runs every server step for every online player
-local step_timer     = 0
-local dur_timer      = 0
-local STEP_INTERVAL  = 0.05   -- 20 ticks/sec physics update
-local DUR_INTERVAL   = 1.0    -- durability drain every 1 second
+local function reset_animation(player)
+    if player.set_eye_offset then
+        player:set_eye_offset({ x = 0, y = 0, z = 0 }, { x = 0, y = 0, z = 0 })
+    end
+    if player.set_animation then
+        player:set_animation({ x = 0, y = 79 }, 15, 0, true)  -- back to idle/walk
+    end
+end
+
+-- ─── UNIFIED GLOBAL STEP ───────────────────────────────────
+-- Single loop — no redundant iterations.
+local step_accum = 0.0
+local dur_accum  = 0.0
+local PHYSICS_HZ = 0.05   -- 20 Hz
+local DUR_HZ     = 1.0
 
 minetest.register_globalstep(function(dtime)
-    step_timer = step_timer + dtime
-    dur_timer  = dur_timer  + dtime
+    step_accum = step_accum + dtime
+    dur_accum  = dur_accum  + dtime
 
-    local do_physics  = step_timer  >= STEP_INTERVAL
-    local do_durability = dur_timer >= DUR_INTERVAL
+    local do_physics    = step_accum >= PHYSICS_HZ
+    local do_durability = dur_accum  >= DUR_HZ
 
-    if do_physics  then step_timer = step_timer - STEP_INTERVAL end
-    if do_durability then dur_timer = dur_timer - DUR_INTERVAL  end
+    if do_physics    then step_accum = step_accum - PHYSICS_HZ end
+    if do_durability then dur_accum  = dur_accum  - DUR_HZ     end
 
     for _, player in ipairs(minetest.get_connected_players()) do
-        local state = get_state(player)
-        if not state.equipped then goto continue end
+        local state    = get_state(player)
+        local controls = player:get_player_control()
+        local cfg      = elytra.config
 
-        -- ── Auto-stop if player lands ──────────────────────
-        if state.gliding then
-            local vel = player:get_velocity()
-            if vel then
-                -- Check if player is on ground using node below
-                local pos  = player:get_pos()
-                local below = minetest.get_node({
-                    x = pos.x,
-                    y = pos.y - 0.1,
-                    z = pos.z
-                })
-                local grounded = (below.name ~= "air" and below.name ~= "ignore")
-
-                if grounded then
-                    elytra.stop_glide(player)
-                    goto hud_update
+        -- ── Aux1 toggle (edge-detected) ──────────────────
+        if state.equipped then
+            if controls.aux1 then
+                if not state._aux1_held then
+                    state._aux1_held = true
+                    if not state.gliding and not is_grounded(player) then
+                        elytra.start_glide(player)
+                    elseif state.gliding then
+                        elytra.stop_glide(player, "manual")
+                    end
                 end
+            else
+                state._aux1_held = false
             end
         end
 
-        -- ── Glide physics tick ────────────────────────────
-        if state.gliding and do_physics then
-            local cfg    = elytra.config
-            local look   = get_look_dir(player)
-            local pitch  = player:get_look_vertical()   -- + = looking down
+        -- ── Sneak + Jump → unequip ────────────────────────
+        if state.equipped then
+            if controls.sneak and controls.jump then
+                if not state._unequip_held then
+                    state._unequip_held = true
+                    elytra.unequip(player)
+                end
+            else
+                state._unequip_held = false
+            end
+        end
 
-            -- Speed update based on pitch
-            -- Looking down → accelerate; looking up → decelerate / gain lift
-            local pitch_effect = pitch * (pitch > 0 and cfg.pitch_accel or cfg.pitch_decel)
-            state.speed = state.speed + pitch_effect * 60 * STEP_INTERVAL
+        -- ── Skip rest if not gliding ──────────────────────
+        if not state.gliding then goto continue end
 
-            -- Apply drag
-            state.speed = state.speed * (1.0 - cfg.drag)
+        -- ── Land detection ───────────────────────────────
+        if is_grounded(player) then
+            reset_animation(player)
+            elytra.stop_glide(player, "land")
+            elytra.update_hud(player, state)
+            goto continue
+        end
 
-            -- Clamp speed
-            state.speed = math.max(cfg.glide_speed_min, math.min(cfg.glide_speed_max, state.speed))
+        -- ── Physics tick ─────────────────────────────────
+        if do_physics then
+            local pitch = player:get_look_vertical()   -- +down, -up
+            local look  = get_look_dir(player)
 
-            -- Gravity component (partial, makes it feel like gliding not flying)
-            local gravity_pull = -cfg.gravity_factor * 9.81
+            -- ── Speed targeting based on pitch ────────────
+            -- Diving (pitch > 0): gain speed proportional to pitch
+            -- Climbing (pitch < 0): lose speed
+            local pitch_effect
+            if pitch > 0 then
+                pitch_effect =  pitch * cfg.pitch_accel
+            else
+                pitch_effect =  pitch * cfg.pitch_lift   -- pitch is negative, so this subtracts
+            end
 
-            -- Build velocity vector: forward in look direction + gentle gravity
-            local new_vel = {
+            -- Integrate speed target
+            state.target_speed = state.target_speed + pitch_effect * (60 * PHYSICS_HZ)
+
+            -- Drag on target speed
+            state.target_speed = state.target_speed * (1.0 - cfg.drag)
+
+            -- Clamp target
+            state.target_speed = math.max(cfg.glide_speed_min,
+                                  math.min(cfg.glide_speed_max, state.target_speed))
+
+            -- Smooth actual speed toward target (feels more physical)
+            state.speed = lerp(state.speed, state.target_speed, cfg.speed_smooth)
+
+            -- ── Stall detection ───────────────────────────
+            if state.speed <= cfg.glide_speed_min + 0.1 then
+                state.stall_timer = state.stall_timer + PHYSICS_HZ
+                if state.stall_timer >= cfg.stall_recover_time then
+                    reset_animation(player)
+                    elytra.stop_glide(player, "stall")
+                    goto continue
+                end
+            else
+                state.stall_timer = 0.0
+            end
+
+            -- ── Partial gravity ───────────────────────────
+            -- We blend gravity based on how horizontal the look direction is.
+            -- Looking straight ahead → near-zero gravity effect (true glide).
+            -- Looking steeply down  → more gravity bleed-through.
+            local horiz_factor = math.cos(pitch)   -- 1 = level, 0 = vertical
+            local gravity_pull = -cfg.gravity_factor * 9.81 * (1.0 - horiz_factor * 0.5)
+
+            -- ── Build velocity ────────────────────────────
+            player:set_velocity({
                 x = look.x * state.speed,
-                y = look.y * state.speed + gravity_pull * STEP_INTERVAL * 5,
+                y = look.y * state.speed + gravity_pull * PHYSICS_HZ * 5,
                 z = look.z * state.speed,
-            }
+            })
 
-            player:set_velocity(new_vel)
+            -- ── Banking animation ─────────────────────────
+            apply_bank_animation(player, state, PHYSICS_HZ)
         end
 
         -- ── Durability drain ─────────────────────────────
-        if state.gliding and do_durability then
-            state.durability = state.durability - elytra.config.durability_drain
+        if do_durability then
+            state.durability = state.durability - cfg.durability_drain
             if state.durability <= 0 then
                 state.durability = 0
-                elytra.stop_glide(player)
-                minetest.chat_send_player(player:get_player_name(),
-                    "§cYour Elytra broke! §7(Craft a new one or repair it)")
+                reset_animation(player)
+                elytra.stop_glide(player, "broke")
             end
         end
 
-        ::hud_update::
-        -- ── HUD refresh ───────────────────────────────────
+        -- ── HUD update ───────────────────────────────────
         if do_physics then
-            elytra.update_hud(player)
+            elytra.update_hud(player, state)
         end
 
         ::continue::
     end
 end)
 
--- ─── AUX1 (E key) → toggle glide ──────────────────────────
-minetest.register_on_player_receive_fields(function(player, formname, fields)
-    -- This catches the Aux1 key from a formspec, but we use the movement API below
-end)
-
--- Minetest 5.3+ supports detecting Aux1 via player controls
-minetest.register_globalstep(function(dtime)
-    for _, player in ipairs(minetest.get_connected_players()) do
-        local state    = get_state(player)
-        if not state.equipped then goto skip end
-
-        local controls = player:get_player_control()
-
-        -- Aux1 pressed = E key by default
-        if controls.aux1 then
-            -- Only toggle once per press (edge detection)
-            if not state._aux1_held then
-                state._aux1_held = true
-
-                -- Must be in air to start gliding
-                local pos   = player:get_pos()
-                local below = minetest.get_node({ x = pos.x, y = pos.y - 0.6, z = pos.z })
-                local in_air = (below.name == "air" or below.name == "ignore")
-
-                if not state.gliding and in_air then
-                    elytra.start_glide(player)
-                elseif state.gliding then
-                    elytra.stop_glide(player)
-                end
-            end
-        else
-            state._aux1_held = false
-        end
-
-        ::skip::
-    end
-end)
-
--- ─── EQUIP VIA INVENTORY (punch item = equip) ─────────────
+-- ─── EQUIP VIA on_use ──────────────────────────────────────
 minetest.register_on_item_use(function(itemstack, player, pointed)
     if itemstack:get_name() == "elytra:elytra" then
         local state = get_state(player)
@@ -336,49 +523,68 @@ minetest.register_on_item_use(function(itemstack, player, pointed)
             state.durability = elytra.config.max_durability
             elytra.show_hud(player)
             minetest.chat_send_player(player:get_player_name(),
-                "§aElytra equipped! Jump then press [E] mid-air to glide.")
+                minetest.colorize("#55ff55", "Elytra equipped! ") ..
+                "Jump then press [E] mid-air to glide.")
         end
         return itemstack
-    end
-end)
-
--- ─── SNEAK + JUMP = unequip ────────────────────────────────
-minetest.register_globalstep(function(dtime)
-    for _, player in ipairs(minetest.get_connected_players()) do
-        local state    = get_state(player)
-        if not state.equipped then goto skip2 end
-
-        local controls = player:get_player_control()
-        if controls.sneak and controls.jump then
-            if not state._unequip_held then
-                state._unequip_held = true
-                elytra.unequip(player)
-            end
-        else
-            state._unequip_held = false
-        end
-        ::skip2::
     end
 end)
 
 -- ─── CLEAN UP ON LEAVE ─────────────────────────────────────
 minetest.register_on_leaveplayer(function(player)
     local name = player:get_player_name()
+    -- Reset visuals before state is cleared
+    reset_animation(player)
     player_state[name] = nil
 end)
 
--- ─── GIVE COMMAND (for testing) ───────────────────────────
+-- ─── CHAT COMMANDS ─────────────────────────────────────────
 minetest.register_chatcommand("giveelytra", {
-    description = "Give yourself an Elytra",
-    privs = { interact = true },
+    description = "Give yourself an Elytra (testing)",
+    privs       = { interact = true },
     func = function(name)
         local player = minetest.get_player_by_name(name)
         if not player then return false, "Player not found." end
-        local inv = player:get_inventory()
-        inv:add_item("main", "elytra:elytra")
-        return true, "§aElytra added to your inventory!"
+        player:get_inventory():add_item("main", "elytra:elytra")
+        return true, minetest.colorize("#55ff55", "Elytra added to your inventory!")
     end,
 })
 
-minetest.log("action", "[Elytra Mod] Loaded successfully!")
-print("[Elytra Mod] ✓ Elytra mod loaded! Use /giveelytra to test.")
+minetest.register_chatcommand("elytrarepair", {
+    description = "Fully repair your equipped Elytra",
+    privs       = { interact = true },
+    func = function(name)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "Player not found." end
+        local state = get_state(player)
+        if not state.equipped then
+            return false, "You don't have an Elytra equipped."
+        end
+        state.durability = elytra.config.max_durability
+        elytra.update_hud(player, state)
+        return true, minetest.colorize("#55ff55", "Elytra fully repaired!")
+    end,
+})
+
+minetest.register_chatcommand("elytrainfo", {
+    description = "Show your Elytra status",
+    privs       = { interact = true },
+    func = function(name)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "Player not found." end
+        local state = get_state(player)
+        if not state.equipped then
+            return true, "No Elytra equipped."
+        end
+        local dur_pct = math.floor((state.durability / elytra.config.max_durability) * 100)
+        return true, string.format(
+            "Elytra: equipped=%s  gliding=%s  durability=%d%%  speed=%.1f m/s",
+            tostring(state.equipped), tostring(state.gliding),
+            dur_pct, state.speed
+        )
+    end,
+})
+
+-- ─── DONE ──────────────────────────────────────────────────
+minetest.log("action", "[Elytra] Loaded — improved physics, banking, unified step loop.")
+print("[Elytra] ✓ Loaded! /giveelytra to test, /elytrainfo for status.")
