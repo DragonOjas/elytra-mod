@@ -29,12 +29,7 @@ local elytra  = {}
 local storage = minetest.get_mod_storage()
 
 -- ─── SAFE COMPAT ───────────────────────────────────────────
--- Minetest 5.3 does not have table.copy in all builds
-local function tcopy(t)
-    local c = {}
-    for k,v in pairs(t) do c[k] = v end
-    return c
-end
+-- (no table.copy dependency needed in this mod)
 
 -- ─── CONFIG ────────────────────────────────────────────────
 local CFG = {
@@ -128,7 +123,6 @@ end
 -- ─── PERSISTENT STORAGE ────────────────────────────────────
 -- Use string keys so we can distinguish durability=0 from "never saved"
 local STOR_DUR  = "v4_dur_"
-local STOR_SET  = "v4_set_"   -- whether elytra is equipped at disconnect
 local STOR_ENC  = "v4_enc_"   -- enchantment level
 
 local function stor_save(key, val)
@@ -358,6 +352,9 @@ local function stop_sound(h)
     if h then pcall(minetest.sound_stop, h) end
 end
 
+-- update_wind: called by callers who already throttle via wind_timer.
+-- This function just stops the old handle and starts a new pitched one.
+-- Do NOT increment wind_timer here — callers own that.
 local function update_wind(player, state)
     if not state.gliding then
         stop_sound(state.wind_handle)
@@ -365,16 +362,12 @@ local function update_wind(player, state)
         return
     end
 
-    state.wind_timer = state.wind_timer + CFG.wind_update_rate
-    -- Fire on the first call and every wind_update_rate seconds after
-    if state.wind_timer < CFG.wind_update_rate and state.wind_handle then return end
-    state.wind_timer = 0.0
-
     local t     = clamp((state.speed - CFG.speed_min) / (CFG.speed_max - CFG.speed_min), 0, 1)
     local pitch = lerp(CFG.wind_pitch_min, CFG.wind_pitch_max, t)
     local gain  = lerp(0.15, 0.85, t)
 
     stop_sound(state.wind_handle)
+    state.wind_handle = nil
     local pos = player:get_pos()
     if pos then
         state.wind_handle = minetest.sound_play(
